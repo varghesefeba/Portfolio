@@ -291,7 +291,7 @@
     dockRow.addEventListener('pointermove', function (e) {
       if (Math.abs(e.clientX - dX) > 8 || Math.abs(e.clientY - dY) > 8) moved = true;
     });
-    var endSwipe = function () { setTimeout(function () { swiping = false; }, 80); };
+    var endSwipe = function () { setTimeout(function () { swiping = false; moved = false; }, 80); };  /* clear moved after the gesture's own click, so a later keyboard Enter/Space isn't suppressed */
     window.addEventListener('pointerup', endSwipe);
     window.addEventListener('pointercancel', endSwipe);
     dockRow.addEventListener('click', function (e) { if (moved) { e.preventDefault(); e.stopPropagation(); } }, true);
@@ -413,26 +413,58 @@
   /* ------------------------------------------------------------------ */
   /*  DOCK launch game — drag any icon and release to "fire" it; the shot  */
   /*  blasts the rest (near = knocked + fall, far = wind sway), then all   */
-  /*  spring back to rest. Mouse / fine-pointer only; respects reduced-mo. */
+  /*  spring back to rest. Works with mouse AND touch; respects reduced-mo.*/
+  /*  Touch: a horizontal swipe scrolls the dock (touch-action:pan-x); an  */
+  /*  upward / diagonal flick on an icon slingshots it. A plain tap opens. */
   /* ------------------------------------------------------------------ */
   (function () {
     if (!dockRow) return;
-    var fine = false, reduced = false;
-    try { fine = window.matchMedia('(hover:hover) and (pointer:fine)').matches; } catch (e) {}
+    var reduced = false;
     try { reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) {}
-    if (!fine || reduced) return;
+    if (reduced) return;
 
-    var S = [], measured = false, raf = 0, drag = null;
+    var S = [], raf = 0, drag = null, pend = null, touchDrag = false, activeId = null;
+    var playing = false, savedSL = 0;
     var startX = 0, startY = 0, moved = false, pX = 0, pY = 0, pT = 0, flvx = 0, flvy = 0;
     var K = 0.10, DP = 0.88, RK = 0.09, RD = 0.88;   /* spring stiffness / damping (pos + rotation) */
 
+    /* On mobile the row is a horizontal scroller (overflow-x:auto), which coerces
+       overflow-y to auto and would clip a flung icon. While the game runs we lift
+       the row to overflow:visible; that resets scrollLeft, so we offset the row by
+       the old scroll amount to keep everything visually put. */
+    function enterPlay() {
+      if (playing) return;
+      playing = true;
+      savedSL = dockRow.scrollLeft || 0;
+      if (dock) dock.classList.add('playing');
+      dockRow.classList.add('playing');
+      dockRow.style.transform = savedSL ? 'translateX(' + (-savedSL) + 'px)' : '';
+    }
+    function endPlay() {
+      if (!playing) return;
+      playing = false;
+      if (dock) dock.classList.remove('playing');
+      dockRow.classList.remove('playing');
+      dockRow.style.transform = '';
+      try { dockRow.scrollLeft = savedSL; } catch (e) {}
+      Array.prototype.forEach.call(dockRow.querySelectorAll('.dock-ic'), function (ic) { ic.style.transition = ''; });  /* hand the .22s hover transition back */
+    }
+
     function measure() {
-      S = Array.prototype.slice.call(dockRow.querySelectorAll('.dock-item')).map(function (item) {
+      /* clear any in-flight transforms first so we read true rest positions
+         (getBoundingClientRect already includes the enterPlay row offset) */
+      var items = Array.prototype.slice.call(dockRow.querySelectorAll('.dock-item'));
+      items.forEach(function (item) {
+        var ic = item.querySelector('.dock-ic');
+        if (ic) { ic.style.transform = ''; ic.style.transition = 'none'; }  /* rAF drives it; kill the CSS .22s so it tracks the finger (esp. on touch, where magnify never set it) */
+        item.style.transform = ''; item.style.zIndex = '';
+      });
+      void dockRow.offsetWidth;
+      S = items.map(function (item) {
         var ic = item.querySelector('.dock-ic'), r = ic.getBoundingClientRect();
         return { item: item, ic: ic, cx: r.left + r.width / 2, cy: r.top + r.height / 2,
                  ox: 0, oy: 0, vx: 0, vy: 0, rot: 0, vrot: 0 };
       });
-      measured = true;
     }
     function find(item) { for (var i = 0; i < S.length; i++) if (S[i].item === item) return S[i]; return null; }
     function render() {
@@ -458,7 +490,7 @@
       }
       render();
       if (moving || drag) { raf = requestAnimationFrame(step); }
-      else { raf = 0; dockGameActive = false; }
+      else { raf = 0; dockGameActive = false; endPlay(); }   /* settled → restore the scroller */
     }
     function kick() { cancelAnimationFrame(raf); raf = requestAnimationFrame(step); }
 
@@ -475,35 +507,55 @@
         t.vy += (ry * 0.55 + dy * 0.4) * mag + 22 * f;  /* + downward so the near ones get knocked down / fall */
         t.vrot += (rx >= 0 ? 1 : -1) * 38 * f;
       }
-      dockGameActive = true; kick();
+      dockGameActive = true;
+      try { if (navigator.vibrate) navigator.vibrate(12); } catch (e) {}
+      kick();
+    }
+
+    /* threshold crossed with launch intent → take over the icon */
+    function beginDrag(e) {
+      var fresh = !playing;                            /* don't re-measure into a still-settling launch */
+      if (fresh) {
+        stopMagnify();                                 /* clear magnify transforms BEFORE reading rest positions */
+        enterPlay();                                   /* lift the scroll clip */
+        measure();                                     /* read rest positions (includes the enterPlay offset) */
+      }
+      drag = find(pend); pend = null;
+      if (!drag) { if (fresh) endPlay(); return; }
+      moved = true; dockGameActive = true;
+      try { dockRow.setPointerCapture(e.pointerId); } catch (err) {}
+      drag.ox = e.clientX - drag.cx; drag.oy = e.clientY - drag.cy;
+      pX = e.clientX; pY = e.clientY; pT = e.timeStamp || 0; flvx = flvy = 0;
+      kick();
     }
 
     dockRow.addEventListener('pointerdown', function (e) {
-      if (e.pointerType && e.pointerType !== 'mouse') return;
-      if (e.button != null && e.button !== 0) return;
+      if (e.button != null && e.button !== 0) return;  /* primary button only */
+      if (drag || pend) return;                        /* one icon at a time */
       var item = e.target && e.target.closest ? e.target.closest('.dock-item') : null;
       if (!item) return;
-      if (!measured) { stopMagnify(); measure(); }
-      drag = find(item); if (!drag) return;
+      pend = item; touchDrag = !!(e.pointerType && e.pointerType !== 'mouse');
+      activeId = e.pointerId;                           /* only this pointer drives/ends the gesture */
       startX = e.clientX; startY = e.clientY; moved = false;
-      pX = e.clientX; pY = e.clientY; pT = e.timeStamp || 0; flvx = flvy = 0;
     });
     window.addEventListener('pointermove', function (e) {
-      if (!drag) return;
-      var dx = e.clientX - startX, dy = e.clientY - startY;
-      if (!moved && (dx * dx + dy * dy) > 64) {        /* >8px → it's a drag, not a click */
-        moved = true; dockGameActive = true; stopMagnify();
-        try { dockRow.setPointerCapture(e.pointerId); } catch (err) {}
-        kick();
-      }
-      if (moved) {
+      if (activeId !== null && e.pointerId !== activeId) return;   /* ignore a 2nd finger */
+      if (drag) {
         drag.ox = e.clientX - drag.cx; drag.oy = e.clientY - drag.cy;
         var t = e.timeStamp || (pT + 16), dt = Math.max(1, t - pT);
         flvx = (e.clientX - pX) / dt * 16; flvy = (e.clientY - pY) / dt * 16;
         pX = e.clientX; pY = e.clientY; pT = t; kick();
+        return;
       }
+      if (!pend) return;
+      var dx = e.clientX - startX, dy = e.clientY - startY;
+      if ((dx * dx + dy * dy) <= 64) return;           /* under ~8px → undecided */
+      if (touchDrag && Math.abs(dy) < Math.abs(dx)) { pend = null; return; }  /* horizontal → let the dock scroll */
+      beginDrag(e);                                    /* mouse: any direction · touch: vertical/diagonal flick */
     });
     window.addEventListener('pointerup', function (e) {
+      if (activeId !== null && e.pointerId !== activeId) return;   /* ignore a 2nd finger's release */
+      activeId = null; pend = null;
       if (!drag) return;
       var o = drag; drag = null;
       if (!moved) return;                              /* a tap → let the normal click open the app */
@@ -513,8 +565,11 @@
       if (sp < 5) { kick(); return; }                  /* barely moved → just spring home */
       launch(o, lvx, lvy);
     });
-    window.addEventListener('pointercancel', function () { if (drag) { drag = null; kick(); } });
-    window.addEventListener('resize', function () { measured = false; });
+    window.addEventListener('pointercancel', function (e) {
+      if (activeId !== null && e.pointerId !== activeId) return;
+      activeId = null; pend = null; if (drag) { drag = null; kick(); }
+    });
+    window.addEventListener('resize', function () { if (playing && !drag) measure(); });  /* orientation / URL-bar change mid-play → re-read centers (settling icons snap, then end cleanly) */
   })();
 
   /* ---- hero: Explore my work (→ Case Studies list) / Get to know me (→ About) ---- */
