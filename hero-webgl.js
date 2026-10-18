@@ -226,12 +226,17 @@ void main(){
       this.clickV = 0;
       this.clickPos = [0, 0];
 
-      if (!this._initGL()) return;
-      this._bindEvents();
-      this._resize();
-      this._loadTextures();
-      this.last = performance.now();
-      this.raf = requestAnimationFrame(this._frame);
+      try {
+        if (!this._initGL()) return;
+        this._bindEvents();
+        this._resize();
+        this._loadTextures();
+        this.last = performance.now();
+        this.raf = requestAnimationFrame(this._frame);
+      } catch (err) {
+        cancelAnimationFrame(this.raf);
+        this._fallback();   /* any WebGL/shader failure → show the static wallpaper image */
+      }
     }
 
     disconnectedCallback() {
@@ -293,6 +298,8 @@ void main(){
     }
 
     _fallback() {
+      if (this._fellBack) return;
+      this._fellBack = true;
       const img = document.createElement('img');
       img.src = SRC[0];
       Object.assign(img.style, { position: 'absolute', inset: '0', width: '100%', height: '100%', objectFit: 'cover' });
@@ -304,12 +311,16 @@ void main(){
       const gl = this.gl;
       SRC.forEach((src, i) => {
         const img = new Image();
-        img.decoding = 'async';
-        img.onload = () => {
-          gl.bindTexture(gl.TEXTURE_2D, this.texs[i]);
-          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, img);
+        const upload = () => {
+          try {
+            gl.bindTexture(gl.TEXTURE_2D, this.texs[i]);
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, img);
+          } catch (e) { /* leave the placeholder if this upload fails */ }
         };
+        /* iOS Safari can fire onload before the bitmap is fully decoded, which
+           uploads a blank (black) texture — gate the upload on decode() first */
+        img.onload = () => { (img.decode ? img.decode() : Promise.resolve()).then(upload, upload); };
         img.src = src;
       });
     }
